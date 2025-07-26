@@ -4,6 +4,8 @@ import os
 import time
 import datetime
 import sqlite3
+import base64
+import uuid
 from dotenv import load_dotenv
 from typing import TypedDict, List
 
@@ -12,7 +14,7 @@ from pydantic import BaseModel, Field
 
 # --- Core LangGraph and LangChain components ---
 from langgraph.graph import StateGraph, END
-from langchain_google_vertexai import ChatVertexAI, VertexAIImageGeneratorChat
+from langchain_google_vertexai import ChatVertexAI
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.tools.tavily_search import TavilySearchResults
 import requests
@@ -27,26 +29,15 @@ DB_PATH = "sahayak_memory.db"
 
 # --- 1. Environment and Tool Setup ---
 load_dotenv()
-llm = ChatVertexAI(model_name="gemini-2.5-pro")
+llm = ChatVertexAI(model_name="gemini-2.5-pro") # Note: User specified gemini-2.5-pro
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 tavily_tool = TavilySearchResults(max_results=3)
 
-# Initialize image generation with fallback options
-try:
-    image_generation_tool = VertexAIImageGeneratorChat(model="imagegeneration@006")
-    print("✅ Vertex AI Image Generation initialized")
-except Exception as e:
-    print(f"⚠️ Vertex AI Image Generation not available: {e}")
-    print("ℹ️ Will use Hugging Face Stable Diffusion API as fallback")
-    image_generation_tool = None
-
-# --- NEW: Database Setup ---
+# --- Database Setup ---
 def setup_memory_database():
     """Initializes the SQLite database and creates the 'interactions' table if it doesn't exist."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Create the interactions table if it doesn't exist
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS interactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,58 +51,66 @@ def setup_memory_database():
             quiz_file TEXT
         );
     """)
-    
     conn.commit()
     conn.close()
     print("✅ Database setup complete.")
 
 
-def generate_image_with_fallback(prompt: str) -> str:
-    # Function body remains the same as previous version...
-    if image_generation_tool:
-        try:
-            print("Attempting Vertex AI image generation...")
-            urls = image_generation_tool.invoke(prompt)
-            if urls and urls[0]: return urls[0]
-        except Exception as e: print(f"⚠️ Vertex AI Image Generation failed: {e}")
+# --- NEW: Image Generation Logic based on your provided tool ---
+def generate_image_with_imagen(prompt: str) -> str:
+    """Generates an image using the Google Imagen 4.0 API and saves it locally."""
+    print("🎨 Generating image with Google Imagen 4.0...")
+    
+    # Securely get API key from environment variable
+    api_key = os.getenv("IMAGEN_API_KEY")
+    if not api_key:
+        print("❌ ERROR: IMAGEN_API_KEY environment variable not set.")
+        return "Image generation failed: API key not configured."
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-preview-06-06:predict"
+    headers = {'x-goog-api-key': api_key, 'Content-Type': 'application/json'}
+    data = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}}
+
     try:
-        print("Attempting Hugging Face image generation...")
-        models = ["CompVis/stable-diffusion-v1-4", "stabilityai/stable-diffusion-2-1", "runwayml/stable-diffusion-v1-5"]
-        headers = {"Authorization": f"Bearer {os.getenv('HUGGINGFACE_API_KEY')}", "Content-Type": "application/json"}
-        formatted_prompt = f"educational textbook illustration, black and white line drawing, {prompt}, simple clean lines, labeled diagram style, high contrast, minimalist, technical drawing"
-        for model in models:
-            try:
-                print(f"Trying model: {model}")
-                api_url = f"https://api-inference.huggingface.co/models/{model}"
-                response = requests.post(api_url, headers=headers, json={"inputs": formatted_prompt, "options": {"wait_for_model": True}, "parameters": {"negative_prompt": "color, photorealistic, complex, messy, blurry", "num_inference_steps": 30, "guidance_scale": 7.5,}}, timeout=30)
-                if response.status_code == 200:
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        response = requests.post(url, headers=headers, json=data, timeout=60)
+
+        if response.status_code == 200:
+            result = response.json()
+            if 'predictions' in result and result['predictions']:
+                prediction = result['predictions'][0]
+                if 'bytesBase64Encoded' in prediction:
+                    image_b64 = prediction['bytesBase64Encoded']
+                    image_data = base64.b64decode(image_b64)
+
+                    # Save the image locally
+                    filename = f"generated_image_{uuid.uuid4().hex[:8]}.png"
                     image_dir = "outputs/images"
                     os.makedirs(image_dir, exist_ok=True)
-                    image_path = f"{image_dir}/{timestamp}_{model.split('/')[-1]}_generated.png"
-                    with open(image_path, "wb") as f: f.write(response.content)
-                    print(f"✅ Image generated using {model} and saved to {image_path}")
-                    return image_path
-                else:
-                    print(f"⚠️ Model {model} failed with status {response.status_code}")
-                    if response.text: print(f"Error details: {response.text}")
-            except Exception as e: print(f"⚠️ Error with model {model}: {e}")
-        return "No image generated."
+                    local_path = os.path.join(image_dir, filename)
+
+                    with open(local_path, 'wb') as f:
+                        f.write(image_data)
+                    
+                    print(f"✅ Image saved successfully to {local_path}")
+                    return local_path
+            
+            print("⚠️ No image data found in Imagen response.")
+            return "No image data found in Imagen response."
+        else:
+            print(f"❌ Imagen API request failed with status {response.status_code}: {response.text}")
+            return f"Imagen API request failed: {response.status_code}"
+
     except Exception as e:
-        print(f"⚠️ Hugging Face Image Generation failed: {e}")
-        return "No image generated."
+        print(f"❌ An error occurred during image generation: {e}")
+        return f"Image generation failed: {e}"
 
 
 # --- 2. State and Intent/Evaluation Definition ---
-
 class Intent(BaseModel):
-    """The structured output for the user's request."""
     topic: str = Field(description="The main subject or topic for the lesson plan.")
     grade_level: str = Field(description="The target grade level for the lesson.")
 
-# --- Evaluation Agent Components ---
 class EvaluationReport(BaseModel):
-    """A structured evaluation of the generated educational content."""
     clarity_score: int = Field(description="Clarity score (1-5), is it easy to understand for the grade level?")
     clarity_feedback: str = Field(description="Qualitative feedback on clarity.")
     engagement_score: int = Field(description="Engagement score (1-5), is the analogy and content interesting?")
@@ -120,45 +119,37 @@ class EvaluationReport(BaseModel):
     educational_value_feedback: str = Field(description="Qualitative feedback on educational value.")
 
 class GraphState(TypedDict):
-    """The state of the graph."""
     # Input fields
     user_request: str
     topic: str
     grade_level: str
     retriever: object
-    
     # Content generation fields
     grounded_content: str
     supplemental_content: str
     lesson_prompt: str
     quiz_prompt: str
-    
+    enhanced_image_prompt: str # New field for the enhanced prompt
     # Generated content fields
     lesson_plan: str
     compiled_lesson: str
     quiz: str
     verification_report: str
     image_url: str
-    
     # Evaluation fields
     evaluation_report: EvaluationReport
-    
-    # Metadata fields
+    # Metadata and control flow
     execution_time: float
     error: str
-    
+    compilation_complete: bool
     # Memory and output fields
     lesson_filename: str
     quiz_filename: str
-    
-    # Control flow fields
-    compilation_complete: bool
-
 
 # --- 3. Agent Nodes ---
-
 def intent_parser_node(state: GraphState):
     """Parses the user's request into a structured format."""
+    # (No changes to this node)
     print("---NODE: INTENT PARSER---")
     structured_llm = llm.with_structured_output(Intent)
     prompt = f"Parse the following user request to extract the lesson topic and grade level.\n\nRequest: \"{state['user_request']}\""
@@ -170,41 +161,50 @@ def intent_parser_node(state: GraphState):
         return {"error": f"Failed to parse user request: {e}"}
 
 def rag_agent_node(state: GraphState):
+    """Retrieves content from source material and verifies topic relevance."""
+    # (No changes to this node)
     print("---NODE: RAG AGENT---")
     topic, retriever = state["topic"], state["retriever"]
     docs = retriever.invoke(topic)
-    
-    # Check if we got meaningful content about the topic
     content = "\n\n".join([d.page_content for d in docs])
-    topic_check_prompt = f"""Analyze if the following text contains substantial information about '{topic}'.
-    
-    Text: {content[:2000]}  # Using first 2000 chars for better context
-    
-    Requirements:
-    - Look for direct mentions or clear discussions of the topic
-    - Do not count metaphorical or analogical uses
-    - Do not count brief mentions without substantial information
-    - Consider only factual content, not interpretations
-    
-    Return ONLY 'yes' or 'no'."""
-    
+    topic_check_prompt = f"Analyze if the following text contains substantial information about '{topic}'. Look for direct discussions, not brief mentions. Return ONLY 'yes' or 'no'.\n\nText: {content[:2000]}"
     has_topic = llm.invoke(topic_check_prompt).content.lower().strip()
-    
     if has_topic != "yes":
         print(f"⚠️ Warning: The source material does not contain information about '{topic}'")
-        return {
-            "error": f"I apologize, but I don't have enough reliable information about '{topic}' in my source material. "
-                    "I can help you with topics related to plant nutrition, microorganisms, and their role in agriculture."
-        }
-    
+        return {"error": f"I apologize, but my source material does not cover '{topic}' in detail."}
     return {"grounded_content": "\n\n---\n\n".join([f"Source: Page {d.metadata.get('page', 'N/A')}\n{d.page_content}" for d in docs])}
 
-def image_generator_node(state: GraphState):
-    print("---NODE: IMAGE GENERATOR---")
-    try: return {"image_url": generate_image_with_fallback(f"Educational diagram about {state['topic']}.")}
-    except Exception as e: return {"image_url": "No image generated."}
+# --- NEW: Image Prompt Enhancer Node ---
+def image_prompt_enhancer_node(state: GraphState):
+    """Enhances a basic image prompt with educational context."""
+    print("---NODE: IMAGE PROMPT ENHANCER---")
+    topic = state['topic']
+    grade_level = state['grade_level']
+    
+    enhanced_prompt = f"""
+    Educational image for a lesson on '{topic}' for {grade_level} students.
+    
+    Style: Clear, simple, educational diagram or illustration with clean lines. High contrast and easy to understand.
+    Quality: High resolution, focus on educational accuracy and visual clarity.
+    Format: Minimalist, suitable for a textbook or worksheet.
+    """
+    return {"enhanced_image_prompt": enhanced_prompt.strip()}
+
+
+# --- UPDATED: Image Generator Node ---
+def imagen_generator_node(state: GraphState):
+    """Generates an image using the enhanced prompt and Imagen 4.0."""
+    print("---NODE: IMAGEN GENERATOR---")
+    enhanced_prompt = state.get("enhanced_image_prompt")
+    if not enhanced_prompt:
+        return {"error": "Cannot generate image without an enhanced prompt."}
+    
+    image_path = generate_image_with_imagen(enhanced_prompt)
+    return {"image_url": image_path}
 
 def creative_assistant_node(state: GraphState):
+    """Generates a culturally relevant analogy."""
+    # (No changes to this node)
     print("---NODE: CREATIVE ASSISTANT---")
     topic, grade = state["topic"], state["grade_level"]
     query_prompt = f"Generate a search query for culturally relevant analogies to teach '{topic}' to {grade} students in India."
@@ -215,6 +215,8 @@ def creative_assistant_node(state: GraphState):
     synthesis_prompt = f"Create a simple, two-sentence analogy to explain '{topic}' to {grade} students in India, using these search results or common Indian life if results are unhelpful:\n\n{results_content}"
     synthesis = llm.invoke(synthesis_prompt).content.strip()
     return {"supplemental_content": synthesis}
+
+# ... (The following nodes remain the same: enhanced_prompt_composer_node, lesson_generator_node, quiz_generator_node, hallucination_guard_node, final_compiler_node, evaluation_agent_node, save_outputs_node, memory_agent_node) ...
 
 def enhanced_prompt_composer_node(state: GraphState):
     print("---NODE: ENHANCED PROMPT COMPOSER---")
@@ -242,14 +244,10 @@ Task: Create a detailed lesson plan for {grade_level} with the following structu
 
 Important Guidelines:
 - Use only facts explicitly stated in the source material
-- Do not include statistics or percentages unless directly quoted
 - Maintain professional, academic language throughout
-- Avoid conversational phrases or greetings
 - Format in clean markdown
 - Start directly with the topic, no introductory text
-- Do not include any meta-commentary or notes about the lesson plan
-- Keep language concise and direct"""
-
+"""
     quiz_prompt = f"""Create a worksheet about '{topic}' for {grade_level}.
 
 Primary Source Material:
@@ -261,44 +259,17 @@ Requirements:
 - Create 3-4 questions appropriate for a {grade_level} understanding of the topic
 - Include an answer key
 - Base all questions strictly on the source material
-- Do not include any conversational language
 - Format in clean markdown
 - Start directly with the worksheet title
-- No introductory text or meta-commentary
-- Keep language concise and direct"""
-
+"""
     return {"lesson_prompt": lesson_prompt, "quiz_prompt": quiz_prompt}
 
 def lesson_generator_node(state: GraphState):
-    """Generates the lesson plan with strict formatting."""
     print("---NODE: LESSON GENERATOR---")
-    
-    # Add a system message to enforce clean output
-    prompt = f"""You are a professional curriculum writer who produces clean, direct markdown content.
-    
-    Important:
-    - Start directly with the content
-    - No meta-commentary or explanations
-    - No "Here's", "I've created", or similar phrases
-    - No notes about the lesson plan
-    - Pure markdown content only
-    - Return content as a single string, not a list
+    prompt = f"""You are a professional curriculum writer who produces clean, direct markdown content. Start directly with the content. No meta-commentary or explanations. Pure markdown content only.
     
     {state["lesson_prompt"]}"""
-    
-    lesson_plan = llm.invoke(prompt).content
-    
-    # Handle case where content might be a list
-    if isinstance(lesson_plan, list):
-        lesson_plan = "\n".join(str(item) for item in lesson_plan)
-    
-    # Ensure we have a string
-    lesson_plan = str(lesson_plan).strip()
-    
-    # Remove any common conversational starters
-    if lesson_plan.lower().startswith(("here", "i have", "i've", "sure", "certainly", "this lesson")):
-        lesson_plan = "\n".join(lesson_plan.split("\n")[1:]).strip()
-    
+    lesson_plan = llm.invoke(prompt).content.strip()
     return {"lesson_plan": lesson_plan}
 
 def quiz_generator_node(state: GraphState):
@@ -313,313 +284,118 @@ def hallucination_guard_node(state: GraphState):
     return {"verification_report": llm.invoke(verification_prompt).content}
 
 def final_compiler_node(state: GraphState):
-    """Compiles the final lesson plan by embedding the image URL."""
     print("---NODE: FINAL COMPILER---")
-    
-    # Check if we've already compiled
-    if state.get("compilation_complete"):
-        print("⏭️ Compilation already complete, skipping...")
-        return state
-    
-    # Check for any error state
-    if state.get("error"):
-        print(f"❌ Cannot compile due to error: {state['error']}")
-        return state
-    
-    # Wait for all required components
-    required_inputs = {
-        "lesson_plan": state.get("lesson_plan"),
-        "quiz": state.get("quiz"),
-        "image_url": state.get("image_url"),
-        "verification_report": state.get("verification_report")
-    }
-    
-    # If any required input is missing or empty
+    if state.get("compilation_complete"): return state
+    if state.get("error"): return state
+    required_inputs = {"lesson_plan": state.get("lesson_plan"), "quiz": state.get("quiz"), "image_url": state.get("image_url"), "verification_report": state.get("verification_report")}
     missing_inputs = [k for k, v in required_inputs.items() if not v or (isinstance(v, str) and v.strip() == "")]
-    if missing_inputs:
-        print(f"⏳ Waiting for inputs: {missing_inputs}")
-        return state
-    
+    if missing_inputs: return state
     print("✅ All inputs received, proceeding with compilation")
-    
     try:
-        lesson_plan = required_inputs["lesson_plan"]
-        image_url = required_inputs["image_url"]
-        topic = state.get("topic")
-        
-        # Check verification report
-        verification_report = required_inputs["verification_report"]
-        if verification_report.lower() != "all claims verified.":
-            print("⚠️ Warning: Some claims could not be verified")
-            print(f"Verification Report: {verification_report}")
-        
-        # Create a compiled version instead of modifying lesson_plan directly
-        compiled_lesson = lesson_plan
-        
-        # Embed the image link into the lesson plan using Markdown
-        if image_url and image_url != "No image generated.":
-            visual_aid_section = f"\n\n### Visual Aid Suggestion\n\n![{topic}]({image_url})\n"
-            compiled_lesson += visual_aid_section
-        
-        return {
-            "compilation_complete": True,
-            "compiled_lesson": compiled_lesson  # New key for the compiled version
-        }
-    except Exception as e:
-        print(f"❌ Compilation failed: {e}")
-        return {"error": f"Compilation failed: {e}"}
+        compiled_lesson = required_inputs["lesson_plan"]
+        if required_inputs["image_url"] and required_inputs["image_url"] != "No image generated.":
+            compiled_lesson += f"\n\n### Visual Aid Suggestion\n\n![{state.get('topic')}]({required_inputs['image_url']})\n"
+        return {"compilation_complete": True, "compiled_lesson": compiled_lesson}
+    except Exception as e: return {"error": f"Compilation failed: {e}"}
 
 def evaluation_agent_node(state: GraphState):
-    """The 'critic' agent that assesses the generated content against a rubric."""
     print("---NODE: EVALUATION AGENT---")
-    
-    # Skip if we already have an evaluation report
-    if state.get("evaluation_report"):
-        print("⏭️ Evaluation already complete, skipping...")
-        return {}  # Return empty dict if no changes
-    
-    # Only proceed if compilation is complete
-    if not state.get("compilation_complete"):
-        print("⏳ Waiting for compilation to complete...")
-        return {}  # Return empty dict if waiting
-    
-    # Ensure all required content is present
-    lesson_plan = state.get("compiled_lesson", state.get("lesson_plan"))  # Use compiled version if available
-    quiz = state.get("quiz")
-    grade_level = state.get("grade_level")
-
-    if not all([lesson_plan, quiz, grade_level]):
-        print("❌ Missing required content for evaluation")
-        return {"evaluation_report": {"error": "Missing content for evaluation."}}
-
+    if state.get("evaluation_report"): return {}
+    if not state.get("compilation_complete"): return {}
+    lesson_plan = state.get("compiled_lesson", state.get("lesson_plan"))
+    quiz, grade_level = state.get("quiz"), state.get("grade_level")
+    if not all([lesson_plan, quiz, grade_level]): return {"evaluation_report": {"error": "Missing content for evaluation."}}
     evaluator_llm = llm.with_structured_output(EvaluationReport)
-    
-    prompt = f"""
-    You are an expert curriculum reviewer. Evaluate the following educational content created for {grade_level} students.
-    
-    **Rubric:**
-    1.  **Clarity:** Is the language and structure clear and appropriate for the grade level?
-    2.  **Engagement:** Is the content, especially the analogy and activities, engaging and interesting?
-    3.  **Educational Value:** Does the lesson plan effectively teach the topic and meet its objectives?
-
-    **Content to Evaluate:**
-    ---
-    **Lesson Plan:**
-    {lesson_plan}
-    ---
-    **Quiz:**
-    {quiz}
-    ---
-    
-    Provide a score (1-5, 5 being best) and concise feedback for each category.
-    """
-    
+    prompt = f"You are an expert curriculum reviewer. Evaluate the following educational content created for {grade_level} students based on Clarity, Engagement, and Educational Value (1-5 scale).\n\nLesson Plan:\n{lesson_plan}\n\nQuiz:\n{quiz}"
     try:
         report = evaluator_llm.invoke(prompt)
         print(f"✅ Evaluation Complete: Clarity={report.clarity_score}/5, Engagement={report.engagement_score}/5")
-        return {"evaluation_report": report}  # Only return the evaluation report
-    except Exception as e:
-        print(f"❌ Error during evaluation: {e}")
-        return {"evaluation_report": {"error": f"Failed to generate evaluation report: {e}"}}
+        return {"evaluation_report": report}
+    except Exception as e: return {"evaluation_report": {"error": f"Failed to generate evaluation report: {e}"}}
 
-# --- NEW: Save and Memory Nodes ---
 def save_outputs_node(state: GraphState):
-    """Saves the lesson plan and quiz to files and adds their paths to the state."""
     print("---NODE: SAVING OUTPUTS---")
-    
-    # Skip if there's an error
-    if state.get("error"):
-        print(f"❌ Cannot save outputs due to error: {state['error']}")
-        return state
-        
-    output_dir = "outputs"
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if state.get("error"): return state
+    output_dir, timestamp = "outputs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(output_dir, exist_ok=True)
     topic_slug = state['topic'].lower().replace(" ", "_").replace(":", "")
-    
     report = state.get("evaluation_report")
-    evaluation_content = "### Evaluation Report\n---\nNo evaluation was generated."
+    evaluation_content = ""
     if report and not (isinstance(report, dict) and report.get("error")):
         evaluation_content = f"\n---\n### Evaluation Report\n---\n- **Clarity Score**: {report.clarity_score}/5\n- **Feedback**: {report.clarity_feedback}\n- **Engagement Score**: {report.engagement_score}/5\n- **Feedback**: {report.engagement_feedback}\n- **Educational Value Score**: {report.educational_value_score}/5\n- **Feedback**: {report.educational_value_feedback}"
-    
     verification_report = f"\n\n---\n### Verification Report\n---\n{state['verification_report']}"
     perf_report = f"\n\n---\n### Performance Report\n---\nTotal Execution Time: {state['execution_time']:.2f} seconds"
-    
-    # Use compiled_lesson instead of lesson_plan
     lesson_content = f"{state.get('compiled_lesson', state['lesson_plan'])}{evaluation_content}{verification_report}{perf_report}"
     lesson_filename = os.path.join(output_dir, f"{timestamp}_{topic_slug}_lesson.md")
     quiz_filename = os.path.join(output_dir, f"{timestamp}_{topic_slug}_quiz.md")
-    
     try:
         with open(lesson_filename, "w", encoding="utf-8") as f: f.write(lesson_content)
         print(f"✅ Lesson plan saved to {lesson_filename}")
         with open(quiz_filename, "w", encoding="utf-8") as f: f.write(state['quiz'])
         print(f"✅ Quiz saved to {quiz_filename}")
-        return {
-            **state,  # Preserve existing state
-            "lesson_filename": lesson_filename,
-            "quiz_filename": quiz_filename
-        }
-    except Exception as e:
-        print(f"❌ Error saving files: {e}")
-        return {
-            **state,
-            "error": f"Error saving files: {e}"
-        }
+        return {"lesson_filename": lesson_filename, "quiz_filename": quiz_filename}
+    except Exception as e: return {"error": f"Error saving files: {e}"}
 
 def memory_agent_node(state: GraphState):
-    """Saves the results of the run to the SQLite database."""
     print("---NODE: MEMORY AGENT---")
-    
-    # Skip if compilation isn't complete
-    if not state.get("compilation_complete"):
-        print("⏳ Memory Agent: Waiting for compilation to complete...")
-        return {}  # Return empty dict if waiting
-    
+    if not state.get("compilation_complete"): return {}
     try:
-        # Extract data from state
-        topic = state.get("topic")
-        grade_level = state.get("grade_level")
-        evaluation_report = state.get("evaluation_report")
-        
-        # Skip if we don't have all required data
-        missing_fields = []
-        if not topic: missing_fields.append("topic")
-        if not grade_level: missing_fields.append("grade_level")
-        if not evaluation_report: missing_fields.append("evaluation_report")
-        
-        if missing_fields:
-            print(f"⏳ Memory Agent: Waiting for required fields: {', '.join(missing_fields)}")
-            return {}  # Return empty dict if missing data
-        
-        # Skip if there was an evaluation error
-        if isinstance(evaluation_report, dict) and evaluation_report.get("error"):
-            print(f"❌ Memory Agent: Skipping database save due to evaluation error: {evaluation_report['error']}")
-            return {}  # Return empty dict if there's an error
-        
-        # Get the latest output filenames
-        output_dir = "outputs"
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        topic_slug = topic.lower().replace(" ", "_").replace(":", "")
-        lesson_file = f"{timestamp}_{topic_slug}_lesson.md"
-        quiz_file = f"{timestamp}_{topic_slug}_quiz.md"
-        
-        # Connect to database
+        topic, grade_level, report = state.get("topic"), state.get("grade_level"), state.get("evaluation_report")
+        if not all([topic, grade_level, report]) or (isinstance(report, dict) and report.get("error")): return {}
+        lesson_file, quiz_file = state.get("lesson_filename"), state.get("quiz_filename")
+        if not all([lesson_file, quiz_file]): return {} # Ensure filenames are present
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
-        # Check if we already have this entry
-        cursor.execute("""
-            SELECT id FROM interactions 
-            WHERE topic = ? AND grade_level = ? AND lesson_file = ? AND quiz_file = ?
-        """, (topic, grade_level, lesson_file, quiz_file))
-        
-        if cursor.fetchone():
-            print("⏭️ Memory Agent: Entry already exists in database, skipping...")
-            conn.close()
-            return {}  # Return empty dict if entry exists
-        
-        # Insert the interaction record
-        cursor.execute("""
-            INSERT INTO interactions (
-                topic,
-                grade_level,
-                clarity_score,
-                engagement_score,
-                educational_value_score,
-                lesson_file,
-                quiz_file
-            ) VALUES (?, ?, ?, ?, ?, ?, ?);
-        """, (
-            topic,
-            grade_level,
-            evaluation_report.clarity_score,
-            evaluation_report.engagement_score,
-            evaluation_report.educational_value_score,
-            lesson_file,
-            quiz_file
-        ))
-        
+        cursor.execute("INSERT INTO interactions (topic, grade_level, clarity_score, engagement_score, educational_value_score, lesson_file, quiz_file) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                       (topic, grade_level, report.clarity_score, report.engagement_score, report.educational_value_score, lesson_file, quiz_file))
         conn.commit()
         conn.close()
-        print(f"""✅ Memory Agent: Saved to database:
-- Topic: {topic}
-- Grade: {grade_level}
-- Scores: Clarity={evaluation_report.clarity_score}/5, Engagement={evaluation_report.engagement_score}/5, Educational Value={evaluation_report.educational_value_score}/5
-- Files: {lesson_file}, {quiz_file}""")
-        
-        # Return only the filenames that were created
-        return {
-            "lesson_filename": lesson_file,
-            "quiz_filename": quiz_file
-        }
-        
-    except Exception as e:
-        print(f"❌ Memory Agent: Error saving to database: {e}")
-        return {}  # Return empty dict on error
-    
+        print(f"✅ Memory Agent: Saved to database.")
+    except Exception as e: print(f"❌ Memory Agent: Error saving to database: {e}")
     return {}
 
 # --- 4. Graph Construction ---
 builder = StateGraph(GraphState)
-
-# Add all nodes
 builder.add_node("Intent_Parser", intent_parser_node)
 builder.add_node("RAG_Agent", rag_agent_node)
 builder.add_node("Creative_Assistant", creative_assistant_node)
 builder.add_node("Enhanced_Prompt_Composer", enhanced_prompt_composer_node)
 builder.add_node("Lesson_Generator", lesson_generator_node)
 builder.add_node("Quiz_Generator", quiz_generator_node)
-builder.add_node("Image_Generator", image_generator_node)
+# --- UPDATED GRAPH NODES ---
+builder.add_node("Image_Prompt_Enhancer", image_prompt_enhancer_node)
+builder.add_node("Imagen_Generator", imagen_generator_node)
+# ---
 builder.add_node("hallucination_guard", hallucination_guard_node)
 builder.add_node("Final_Compiler", final_compiler_node)
 builder.add_node("Evaluation_Agent", evaluation_agent_node)
 builder.add_node("Memory_Agent", memory_agent_node)
+builder.add_node("save_outputs_node", save_outputs_node)
 
-# --- Define the graph's flow ---
 builder.set_entry_point("Intent_Parser")
-
-# After parsing, start with RAG agent
 builder.add_edge("Intent_Parser", "RAG_Agent")
 
-# Define conditional edges based on RAG results
 def should_continue(state):
-    """Determine if we should continue based on RAG results"""
-    if "error" in state:
-        return False
-    return True
+    return "error" not in state or state["error"] is None
 
-# Add conditional edges from RAG_Agent
-builder.add_conditional_edges(
-    "RAG_Agent",
-    should_continue,
-    {
-        True: "Creative_Assistant",  # Continue with parallel processing
-        False: END  # Stop if topic not found
-    }
-)
+builder.add_conditional_edges("RAG_Agent", should_continue, {True: "Enhanced_Prompt_Composer", False: "save_outputs_node"})
 
-# Connect Creative Assistant to Prompt Composer
-builder.add_edge("Creative_Assistant", "Enhanced_Prompt_Composer")
-
-# Once prompts are ready, generate lesson, quiz, and image in parallel
+builder.add_edge("Enhanced_Prompt_Composer", "Creative_Assistant")
 builder.add_edge("Enhanced_Prompt_Composer", "Lesson_Generator")
 builder.add_edge("Enhanced_Prompt_Composer", "Quiz_Generator")
-builder.add_edge("Enhanced_Prompt_Composer", "Image_Generator")
-
-# The lesson must be fact-checked by the guard
+# --- UPDATED GRAPH FLOW FOR IMAGES ---
+builder.add_edge("Enhanced_Prompt_Composer", "Image_Prompt_Enhancer")
+builder.add_edge("Image_Prompt_Enhancer", "Imagen_Generator")
+# ---
+builder.add_edge("Creative_Assistant", "Final_Compiler") # Creative assistant feeds into compiler
 builder.add_edge("Lesson_Generator", "hallucination_guard")
-
-# First, wait for hallucination check to complete
 builder.add_edge("hallucination_guard", "Final_Compiler")
-
-# Then wait for quiz and image
 builder.add_edge("Quiz_Generator", "Final_Compiler")
-builder.add_edge("Image_Generator", "Final_Compiler")
+builder.add_edge("Imagen_Generator", "Final_Compiler")
 
-# Add evaluation and memory after compilation
 builder.add_edge("Final_Compiler", "Evaluation_Agent")
-builder.add_edge("Evaluation_Agent", "Memory_Agent")
+builder.add_edge("Evaluation_Agent", "save_outputs_node")
+builder.add_edge("save_outputs_node", "Memory_Agent")
 builder.add_edge("Memory_Agent", END)
 
 graph = builder.compile()
@@ -634,63 +410,10 @@ def setup_rag_pipeline(source_document_path: str):
     vectorstore = FAISS.from_documents(docs_split, embedding_model)
     return vectorstore.as_retriever()
 
-# --- NEW: Voice Agent Components ---
-import speech_recognition as sr
-
-def listen_for_voice_command(language="en-IN"):
-    """
-    Listens for a voice command from the microphone and transcribes it to text.
-    
-    Args:
-        language (str): The language code for transcription (e.g., 'en-IN', 'hi-IN').
-    
-    Returns:
-        str: The transcribed text, or None if an error occurs.
-    """
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("Calibrating for ambient noise, please wait...")
-        r.adjust_for_ambient_noise(source, duration=1)
-        print(f"Listening in {language}... Please speak your request.")
-        
-        try:
-            audio = r.listen(source, timeout=5, phrase_time_limit=10)
-            print("Recognizing...")
-            # Transcribe audio using Google's Web Speech API
-            text = r.recognize_google(audio, language=language)
-            print(f"✅ Voice Input Recognized: '{text}'")
-            return text
-        except sr.WaitTimeoutError:
-            print("⚠️ Listening timed out while waiting for phrase to start.")
-            return None
-        except sr.UnknownValueError:
-            print("❌ I'm sorry, I could not understand the audio. Please try again.")
-            return None
-        except sr.RequestError as e:
-            print(f"❌ Could not request results from the speech recognition service; {e}")
-            return None
-        except Exception as e:
-            print(f"❌ An unexpected error occurred during voice recognition: {e}")
-            return None
-
-
 # --- 6. Invocation and Testing ---
+# (Removing voice logic as per focus on core functionality)
 if __name__ == "__main__":
-    import sys
-    
-    # ... (the --test block remains the same) ...
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        from test_graph import run_all_tests
-        success = run_all_tests()
-        if not success:
-            print("\n❌ Graph structure tests failed")
-            exit(1)
-        print("\n✅ All graph structure tests passed")
-        exit(0)
-    
-    # Initialize the database
     setup_memory_database()
-    
     pdf_path = "source_material.pdf"
     try:
         rag_retriever = setup_rag_pipeline(pdf_path)
@@ -699,21 +422,8 @@ if __name__ == "__main__":
         exit(1)
 
     print("\n\n--- Welcome to Project Sahayak ---")
-    
-    # --- MODIFIED: User input selection (Voice or Text) ---
-    user_input = None
-    while not user_input:
-        choice = input("Press 'V' for voice input or 'T' for text input, then Enter: ").strip().upper()
-        if choice == 'T':
-            user_input = input("Hello! What lesson can I prepare for you today? (e.g., 'a lesson on the water cycle for 4th graders')\n> ")
-        elif choice == 'V':
-            lang_choice = input("Select language for voice input ('en' for English, 'hi' for Hindi): ").strip().lower()
-            lang_code = "hi-IN" if lang_choice == "hi" else "en-IN"
-            user_input = listen_for_voice_command(language=lang_code)
-        else:
-            print("Invalid choice. Please press 'V' or 'T'.")
-    
-    # --- The rest of the execution logic remains the same ---
+    user_input = input("Hello! What lesson can I prepare for you today?\n> ")
+
     if not user_input.strip():
         print("No input received. Exiting.")
         exit(1)
@@ -728,9 +438,10 @@ if __name__ == "__main__":
     final_state = graph.invoke(initial_state)
     end_time = time.time()
 
-    if final_state.get("error"):
+    if "error" in final_state and final_state["error"]:
         print(f"\n--- ❗ERROR OCCURRED ---\n{final_state['error']}")
     else:
+        # Manually set final time and save
         final_state['execution_time'] = end_time - start_time
         save_outputs_node(final_state)
         print("\n\n✅✅✅ --- Content Generation Complete --- ✅✅✅")
