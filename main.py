@@ -16,17 +16,36 @@ from langchain_google_vertexai import ChatVertexAI, VertexAIImageGeneratorChat
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.tools.tavily_search import TavilySearchResults
 import requests
+import re
+import json
+
+# --- Firestore imports ---
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    from google.cloud.firestore import Client
+    FIRESTORE_AVAILABLE = True
+except ImportError:
+    print("⚠️ Firebase Admin SDK not available. Firestore will be disabled.")
+    FIRESTORE_AVAILABLE = False
 
 # --- RAG specific components ---
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
+# --- 1. Environment Setup ---
+load_dotenv()
+
 # --- Database Configuration ---
 DB_PATH = "sahayak_memory.db"
 
-# --- 1. Environment and Tool Setup ---
-load_dotenv()
+# --- Firestore Configuration ---
+FIRESTORE_ENABLED = os.getenv('FIRESTORE_ENABLED', 'false').lower() == 'true'
+FIRESTORE_PROJECT_ID = os.getenv('FIRESTORE_PROJECT_ID', '')
+FIRESTORE_COLLECTION = os.getenv('FIRESTORE_COLLECTION', 'lessons')
+
+# --- Tool Setup ---
 llm = ChatVertexAI(model_name="gemini-2.5-pro")
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 tavily_tool = TavilySearchResults(max_results=3)
@@ -64,6 +83,28 @@ def setup_memory_database():
     conn.commit()
     conn.close()
     print("✅ Database setup complete.")
+
+
+# --- NEW: JSON Data Models for Direct LLM Generation ---
+class LessonContent(BaseModel):
+    """Structured lesson content for frontend consumption."""
+    title: str = Field(description="The title of the lesson")
+    objectives: List[str] = Field(description="List of learning objectives")
+    materials: List[str] = Field(description="List of required materials")
+    introduction: str = Field(description="Introduction text for the lesson")
+    activities: List[dict] = Field(description="List of activities with title and description")
+    assessment: str = Field(description="Assessment description")
+    visualAid: dict = Field(description="Visual aid information with imageUrl and description")
+
+
+class QuizContent(BaseModel):
+    """Structured quiz content for frontend consumption."""
+    title: str = Field(description="The title of the quiz")
+    questions: List[dict] = Field(description="List of questions with options and correct answer")
+    answerKey: List[dict] = Field(description="Answer key with question index and correct answer")
+
+
+
 
 
 def generate_image_with_fallback(prompt: str) -> str:
@@ -140,6 +181,10 @@ class GraphState(TypedDict):
     verification_report: str
     image_url: str
     
+    # Structured JSON content for frontend
+    lesson_content_json: LessonContent
+    quiz_content_json: QuizContent
+    
     # Evaluation fields
     evaluation_report: EvaluationReport
     
@@ -153,6 +198,100 @@ class GraphState(TypedDict):
     
     # Control flow fields
     compilation_complete: bool
+
+
+# --- NEW: Firestore Functions ---
+def init_firestore():
+    """Initialize Firestore connection."""
+    if not FIRESTORE_ENABLED:
+        return None
+    
+    try:
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        db = firestore.client()
+        print("✅ Firestore initialized successfully")
+        return db
+    except Exception as e:
+        print(f"⚠️ Firestore initialization failed: {e}")
+        return None
+
+
+def create_firestore_document(state: GraphState) -> dict:
+    """Create Firestore document from state data."""
+    try:
+        # Extract data from state
+        topic = state.get("topic", "")
+        grade_level = state.get("grade_level", "")
+        evaluation_report = state.get("evaluation_report")
+        lesson_content = state.get("lesson_content_json")
+        quiz_content = state.get("quiz_content_json")
+        analogy = state.get("supplemental_content", "")
+        execution_time = state.get("execution_time", 0.0)
+        lesson_filename = state.get("lesson_filename", "")
+        quiz_filename = state.get("quiz_filename", "")
+        
+        # Create document structure
+        document = {
+            "topic": topic,
+            "gradeLevel": grade_level,
+            "createdAt": datetime.datetime.now().isoformat(),
+            "analogy": analogy,
+            "metadata": {
+                "executionTime": execution_time,
+                "lessonFilename": lesson_filename,
+                "quizFilename": quiz_filename
+            }
+        }
+        
+        # Add lesson content if available
+        if lesson_content:
+            document["lessonContent"] = lesson_content.model_dump()
+        
+        # Add quiz content if available
+        if quiz_content:
+            document["quizContent"] = quiz_content.model_dump()
+        
+        # Add evaluation if available
+        if evaluation_report and not isinstance(evaluation_report, dict):
+            document["evaluation"] = {
+                "clarity_score": evaluation_report.clarity_score,
+                "clarity_feedback": evaluation_report.clarity_feedback,
+                "engagement_score": evaluation_report.engagement_score,
+                "engagement_feedback": evaluation_report.engagement_feedback,
+                "educational_value_score": evaluation_report.educational_value_score,
+                "educational_value_feedback": evaluation_report.educational_value_feedback
+            }
+        
+        return document
+        
+    except Exception as e:
+        print(f"⚠️ Error creating Firestore document: {e}")
+        return None
+
+
+def save_to_firestore(state: GraphState) -> bool:
+    """Save lesson data to Firestore."""
+    if not FIRESTORE_ENABLED:
+        return False
+    
+    try:
+        db = init_firestore()
+        if not db:
+            return False
+        
+        document = create_firestore_document(state)
+        if not document:
+            return False
+        
+        # Save to Firestore
+        doc_ref = db.collection(FIRESTORE_COLLECTION).add(document)
+        print(f"✅ Saved to Firestore with ID: {doc_ref[1].id}")
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ Error saving to Firestore: {e}")
+        return False
 
 
 # --- 3. Agent Nodes ---
@@ -300,6 +439,130 @@ def lesson_generator_node(state: GraphState):
         lesson_plan = "\n".join(lesson_plan.split("\n")[1:]).strip()
     
     return {"lesson_plan": lesson_plan}
+
+
+def lesson_json_generator_node(state: GraphState):
+    """Generates structured JSON lesson content for frontend."""
+    print("---NODE: LESSON JSON GENERATOR---")
+    
+    # Get the markdown lesson content
+    lesson_plan = state.get("lesson_plan", "")
+    topic = state.get("topic", "")
+    grade_level = state.get("grade_level", "")
+    
+    if not lesson_plan:
+        print("⚠️ No lesson plan available for JSON generation")
+        return {}
+    
+    # Create structured prompt for JSON generation
+    json_prompt = f"""Convert the following lesson plan into structured JSON format for frontend consumption.
+
+Lesson Plan:
+{lesson_plan}
+
+Topic: {topic}
+Grade Level: {grade_level}
+
+Generate a structured JSON object with the following format:
+{{
+  "title": "Lesson title extracted from the content",
+  "objectives": ["objective 1", "objective 2", "objective 3"],
+  "materials": ["material 1", "material 2", "material 3"],
+  "introduction": "Introduction text from the lesson",
+  "activities": [
+    {{
+      "title": "Activity title",
+      "description": "Activity description"
+    }}
+  ],
+  "assessment": "Assessment description",
+  "visualAid": {{
+    "imageUrl": "",
+    "description": "Visual aid description if mentioned"
+  }}
+}}
+
+Important:
+- Extract objectives from the lesson plan
+- Extract materials from the lesson plan
+- Extract activities with their titles and descriptions
+- Extract assessment information
+- Keep the JSON structure clean and valid
+- If any field is not found in the lesson, use appropriate default values
+"""
+    
+    try:
+        # Use structured output to generate JSON
+        structured_llm = llm.with_structured_output(LessonContent)
+        lesson_content_json = structured_llm.invoke(json_prompt)
+        
+        print("✅ Structured lesson JSON generated successfully")
+        return {"lesson_content_json": lesson_content_json}
+        
+    except Exception as e:
+        print(f"⚠️ Error generating lesson JSON: {e}")
+        return {}
+
+
+def quiz_json_generator_node(state: GraphState):
+    """Generates structured JSON quiz content for frontend."""
+    print("---NODE: QUIZ JSON GENERATOR---")
+    
+    # Get the markdown quiz content
+    quiz = state.get("quiz", "")
+    topic = state.get("topic", "")
+    
+    if not quiz:
+        print("⚠️ No quiz available for JSON generation")
+        return {}
+    
+    # Create structured prompt for JSON generation
+    json_prompt = f"""Convert the following quiz into structured JSON format for frontend consumption.
+
+Quiz:
+{quiz}
+
+Topic: {topic}
+
+Generate a structured JSON object with the following format:
+{{
+  "title": "Quiz title",
+  "questions": [
+    {{
+      "question": "Question text",
+      "type": "multiple_choice",
+      "options": ["option A", "option B", "option C", "option D"],
+      "answer": "correct answer"
+    }}
+  ],
+  "answerKey": [
+    {{
+      "questionIndex": 0,
+      "correctAnswer": "correct answer",
+      "explanation": "explanation for the answer"
+    }}
+  ]
+}}
+
+Important:
+- Extract questions and their options
+- Identify correct answers
+- Create answer key with explanations
+- Keep the JSON structure clean and valid
+- If any field is not found in the quiz, use appropriate default values
+"""
+    
+    try:
+        # Use structured output to generate JSON
+        structured_llm = llm.with_structured_output(QuizContent)
+        quiz_content_json = structured_llm.invoke(json_prompt)
+        
+        print("✅ Structured quiz JSON generated successfully")
+        return {"quiz_content_json": quiz_content_json}
+        
+    except Exception as e:
+        print(f"⚠️ Error generating quiz JSON: {e}")
+        return {}
 
 def quiz_generator_node(state: GraphState):
     print("---NODE: QUIZ GENERATOR---")
@@ -542,11 +805,18 @@ def memory_agent_node(state: GraphState):
         
         conn.commit()
         conn.close()
-        print(f"""✅ Memory Agent: Saved to database:
+        print(f"""✅ Memory Agent: Saved to SQLite database:
 - Topic: {topic}
 - Grade: {grade_level}
 - Scores: Clarity={evaluation_report.clarity_score}/5, Engagement={evaluation_report.engagement_score}/5, Educational Value={evaluation_report.educational_value_score}/5
 - Files: {lesson_file}, {quiz_file}""")
+        
+        # --- NEW: Save to Firestore ---
+        firestore_success = save_to_firestore(state)
+        if firestore_success:
+            print("✅ Memory Agent: Also saved to Firestore")
+        else:
+            print("⚠️ Memory Agent: Firestore save failed, but SQLite save succeeded")
         
         # Return only the filenames that were created
         return {
@@ -569,7 +839,9 @@ builder.add_node("RAG_Agent", rag_agent_node)
 builder.add_node("Creative_Assistant", creative_assistant_node)
 builder.add_node("Enhanced_Prompt_Composer", enhanced_prompt_composer_node)
 builder.add_node("Lesson_Generator", lesson_generator_node)
+builder.add_node("Lesson_JSON_Generator", lesson_json_generator_node)
 builder.add_node("Quiz_Generator", quiz_generator_node)
+builder.add_node("Quiz_JSON_Generator", quiz_json_generator_node)
 builder.add_node("Image_Generator", image_generator_node)
 builder.add_node("hallucination_guard", hallucination_guard_node)
 builder.add_node("Final_Compiler", final_compiler_node)
@@ -607,15 +879,21 @@ builder.add_edge("Enhanced_Prompt_Composer", "Lesson_Generator")
 builder.add_edge("Enhanced_Prompt_Composer", "Quiz_Generator")
 builder.add_edge("Enhanced_Prompt_Composer", "Image_Generator")
 
+# Generate structured JSON content after markdown content is ready
+builder.add_edge("Lesson_Generator", "Lesson_JSON_Generator")
+builder.add_edge("Quiz_Generator", "Quiz_JSON_Generator")
+
 # The lesson must be fact-checked by the guard
 builder.add_edge("Lesson_Generator", "hallucination_guard")
 
 # First, wait for hallucination check to complete
 builder.add_edge("hallucination_guard", "Final_Compiler")
 
-# Then wait for quiz and image
+# Then wait for quiz, image, and JSON content
 builder.add_edge("Quiz_Generator", "Final_Compiler")
 builder.add_edge("Image_Generator", "Final_Compiler")
+builder.add_edge("Lesson_JSON_Generator", "Final_Compiler")
+builder.add_edge("Quiz_JSON_Generator", "Final_Compiler")
 
 # Add evaluation and memory after compilation
 builder.add_edge("Final_Compiler", "Evaluation_Agent")

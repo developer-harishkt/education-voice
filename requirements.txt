@@ -7,4 +7,7 @@ faiss-cpu
 pydantic
 requests
 python-dotenv
-huggingface-hub 
+huggingface-hub
+firebase-admin
+google-cloud-firestore
+SpeechRecognition 
