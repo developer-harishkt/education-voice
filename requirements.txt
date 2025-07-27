@@ -20,6 +20,9 @@ sentence-transformers
 langchain-text-splitters
 pypdf
 
+# Language Detection
+langdetect
+
 # Other Tools
 python-dotenv
 tavily-python

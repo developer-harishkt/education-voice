@@ -16,6 +16,21 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# --- Health Check Endpoint ---
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {"message": "Project Sahayak API is running!", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check endpoint."""
+    return {
+        "status": "healthy",
+        "message": "Project Sahayak API is running!",
+        "version": "1.0.0"
+    }
+
 # --- One-time Setup ---
 @app.on_event("startup")
 def startup_event():
@@ -25,7 +40,7 @@ def startup_event():
         # Initialize Firebase
         initialize_firebase()
         # Setup the RAG pipeline retriever globally
-        app.state.rag_retriever = setup_rag_pipeline("source_material.pdf")
+        app.state.rag_retriever = setup_rag_pipeline()
         print("✅ RAG pipeline retriever is ready.")
     except Exception as e:
         print(f"❌ Critical startup error: {e}")

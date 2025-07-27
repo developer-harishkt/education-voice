@@ -85,8 +85,17 @@ def enhanced_prompt_composer_node(state: GraphState):
     """Creates the final prompts for the lesson and quiz generators."""
     print("---NODE: ENHANCED PROMPT COMPOSER---")
     grounded_content, supplemental_content, topic, grade_level = state["grounded_content"], state["supplemental_content"], state["topic"], state["grade_level"]
+    
+    # Get language from retriever if available
+    document_language = getattr(state.get("retriever"), "_document_language", "English")
+    print(f"🌐 Using language: {document_language}")
+    
+    # Get language-specific prompts
+    from .utils import get_language_specific_prompt
+    language_prompts = get_language_specific_prompt(document_language, topic, grade_level)
+    
+    lesson_prompt = f"""{language_prompts['lesson']}
 
-    lesson_prompt = f"""Create a lesson plan about '{topic}'.
 Primary Source Material (Facts):
 ---
 {grounded_content}
@@ -94,32 +103,18 @@ Primary Source Material (Facts):
 Creative Element (Analogy):
 ---
 {supplemental_content}
----
-Task: Create a detailed lesson plan for {grade_level} with the following structure:
-1. Topic
-2. Target Grade ({grade_level})
-3. Objectives
-4. Materials
-5. Introduction (incorporate the creative analogy)
-6. Activities
-7. Assessment
-Important Guidelines:
-- Use only facts explicitly stated in the source material.
-- Maintain professional, academic language.
-- Format in clean markdown.
-- Start directly with the topic, no introductory text."""
+---"""
 
-    quiz_prompt = f"""Create a worksheet about '{topic}' for {grade_level}.
+    quiz_prompt = f"""{language_prompts['quiz']}
+
 Primary Source Material:
 ---
 {grounded_content}
 ---
-Requirements:
-- Create 3-4 questions appropriate for a {grade_level} understanding.
-- Include an answer key.
-- Base all questions strictly on the source material.
-- Format in clean markdown.
-- Start directly with the worksheet title."""
+Creative Element:
+---
+{supplemental_content}
+---"""
 
     return {"lesson_prompt": lesson_prompt, "quiz_prompt": quiz_prompt}
 
