@@ -186,6 +186,10 @@ def firebase_publish_node(state: GraphState):
         print("❌ Cannot publish to Firebase: user_uuid is missing from state.")
         return {"error": "User UUID not found for publishing."}
 
+    # Create a unique timestamp for this lesson plan
+    timestamp = datetime.datetime.now()
+    lesson_id = timestamp.strftime("%Y%m%d_%H%M%S")
+
     # Prepare the data payload
     final_lesson_plan = {
         "topic": state.get("topic"),
@@ -194,19 +198,26 @@ def firebase_publish_node(state: GraphState):
         "quiz": state.get("quiz"),
         "evaluation": state.get("evaluation_report", {}).dict() if state.get("evaluation_report") else {},
         "status": "completed",
-        "timestamp": datetime.datetime.now().isoformat()
+        "timestamp": timestamp.isoformat(),
+        "lesson_id": lesson_id
     }
 
     try:
-        # The path in Firebase where the data will be stored
-        ref = db.reference(f"/lesson_plans/{user_uuid}")
+        # Store the lesson plan with a unique ID to append instead of replace
+        ref = db.reference(f"/lesson_plans/{user_uuid}/{lesson_id}")
         ref.set(final_lesson_plan)
-        print(f"✅ Successfully published lesson for user {user_uuid} to Firebase.")
+        print(f"✅ Successfully published lesson {lesson_id} for user {user_uuid} to Firebase.")
+        
+        # Also update the user's latest lesson reference for easy access
+        latest_ref = db.reference(f"/lesson_plans/{user_uuid}/latest")
+        latest_ref.set(final_lesson_plan)
+        print(f"✅ Updated latest lesson reference for user {user_uuid}.")
+        
     except Exception as e:
         print(f"❌ Failed to publish to Firebase: {e}")
         # Optionally update Firebase with an error status
-        error_ref = db.reference(f"/lesson_plans/{user_uuid}")
-        error_ref.set({"status": "failed", "error": str(e)})
+        error_ref = db.reference(f"/lesson_plans/{user_uuid}/errors/{lesson_id}")
+        error_ref.set({"status": "failed", "error": str(e), "timestamp": timestamp.isoformat()})
         return {"error": f"Firebase publishing failed: {e}"}
 
     return {}
