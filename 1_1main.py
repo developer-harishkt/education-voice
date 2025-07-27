@@ -5,7 +5,6 @@ import uuid
 import base64
 from dotenv import load_dotenv
 from typing import TypedDict
-import argparse # Added for command-line parsing
 
 # --- Pydantic for structured output ---
 from pydantic import BaseModel, Field
@@ -13,7 +12,7 @@ from pydantic import BaseModel, Field
 # --- Core LangGraph and LangChain components ---
 from langgraph.graph import StateGraph, END
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
 import requests
 
 # --- RAG specific components ---
@@ -31,7 +30,7 @@ from firebase_admin import credentials, firestore, _apps
 # ==============================================================================
 load_dotenv()
 
-# --- Initialize Firebase Admin SDK (Corrected) ---
+# --- Initialize Firebase Admin SDK ---
 db = None
 try:
     if not _apps:
@@ -43,39 +42,45 @@ except Exception as e:
     db = None
 
 # --- Initialize LLM and Tools ---
-llm = ChatVertexAI(model_name="gemini-2.5-pro")
-embedding_model = VertexAIEmbeddings(model_name="text-multilingual-embedding-002")
-tavily_tool = TavilySearchResults(max_results=3)
+llm = ChatVertexAI(model_name="gemini-1.5-pro")
+
+# --- MEMORY OPTIMIZATION: Switched to serverless VertexAIEmbeddings ---
+try:
+    embedding_model = VertexAIEmbeddings(model_name="gemini-embedding-001")
+except Exception as e:
+    print(f"Warning: Could not initialize VertexAI embeddings: {e}")
+    # Fallback to a simpler embedding model
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+tavily_tool = TavilySearch(max_results=3)
 
 # --- Initialize RAG Retriever ---
 PDF_PATH = "source_material.pdf"
 RAG_RETRIEVER = None
 try:
     print("Setting up RAG pipeline...")
-    INDEX_PATH = "faiss_index"
-    if os.path.exists(INDEX_PATH):
-        # We must add allow_dangerous_deserialization=True for FAISS with LangChain
-        vectorstore = FAISS.load_local(INDEX_PATH, embedding_model, allow_dangerous_deserialization=True)
-        RAG_RETRIEVER = vectorstore.as_retriever()
-        print("✅ RAG index loaded successfully from local path.")
-    else:
-        print(f"⚠️ Pre-built index not found at '{INDEX_PATH}'. Building new one...")
-        loader = PyPDFLoader(PDF_PATH)
-        docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        docs_split = splitter.split_documents(docs)
-        vectorstore = FAISS.from_documents(docs_split, embedding_model)
-        RAG_RETRIEVER = vectorstore.as_retriever()
-        print("✅ RAG pipeline setup complete.")
+    loader = PyPDFLoader(PDF_PATH)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs_split = splitter.split_documents(docs)
+    vectorstore = FAISS.from_documents(docs_split, embedding_model)
+    RAG_RETRIEVER = vectorstore.as_retriever()
+    print("✅ RAG pipeline setup complete.")
 except Exception as e:
-    print(f"❌ FATAL: Could not set up RAG pipeline: {e}")
+    print(f"❌ FATAL: Could not set up RAG pipeline during initialization: {e}")
 
+# --- Progress Tracking Mapping ---
+NODE_PROGRESS = {
+    "Intent_Parser": 10, "RAG_Agent": 20, "Creative_Assistant": 30,
+    "Enhanced_Prompt_Composer": 40, "Lesson_Generator": 55, "Quiz_Generator": 55,
+    "Image_Prompt_Enhancer": 55, "hallucination_guard": 70, "Imagen_Generator": 80,
+    "Final_Compiler": 85, "Evaluation_Agent": 90, "save_to_firestore_node": 100
+}
 
 # ==============================================================================
-# --- (Sections 2, 3, 4, 5: State, Helpers, Nodes, Graph - No Changes) ---
-# ... (all the nodes and graph definition code remains exactly the same) ...
+# --- 2. STATE AND DATA MODELS ---
 # ==============================================================================
-
 class Intent(BaseModel):
     topic: str = Field(description="The main subject of the lesson plan.")
     grade_level: str = Field(description="The target grade level for the lesson.")
@@ -97,14 +102,10 @@ class GraphState(TypedDict):
     verification_report: str; image_url: str
     evaluation_report: EvaluationReport
     error: str; compilation_complete: bool
-    
-NODE_PROGRESS = {
-    "Intent_Parser": 10, "RAG_Agent": 20, "Creative_Assistant": 30,
-    "Enhanced_Prompt_Composer": 40, "Lesson_Generator": 55, "Quiz_Generator": 55,
-    "Image_Prompt_Enhancer": 55, "hallucination_guard": 70, "Imagen_Generator": 80,
-    "Final_Compiler": 85, "Evaluation_Agent": 90, "save_to_firestore_node": 100
-}
 
+# ==============================================================================
+# --- 3. HELPER FUNCTIONS ---
+# ==============================================================================
 def update_progress(state: GraphState, current_node: str):
     run_id, user_id, thread_id = state['run_id'], state['user_id'], state['thread_id']
     if not db or not run_id: return
@@ -121,6 +122,9 @@ def generate_image_with_imagen(prompt: str) -> str:
     print("🎨 Simulating image generation...")
     return "https://storage.googleapis.com/your-bucket-name/placeholder.png"
 
+# ==============================================================================
+# --- 4. GRAPH AGENT NODES ---
+# ==============================================================================
 def intent_parser_node(state: GraphState):
     update_progress(state, "Intent_Parser")
     structured_llm = llm.with_structured_output(Intent)
@@ -146,16 +150,20 @@ def creative_assistant_node(state: GraphState):
 def enhanced_prompt_composer_node(state: GraphState):
     update_progress(state, "Enhanced_Prompt_Composer")
     lesson_prompt = f"""Create a lesson plan about '{state['topic']}'. 
+
 Primary Source Material (Facts):
 ---
 {state['grounded_content']}
 ---
+
 Creative Element (Analogy):
 ---
 {state['supplemental_content']}
 ---
+
 Task: Create a detailed lesson plan for {state['grade_level']} with a standard educational structure."""
     quiz_prompt = f"""Create a worksheet with 3-4 questions and an answer key about '{state['topic']}' for {state['grade_level']}.
+
 Primary Source Material:
 ---
 {state['grounded_content']}
@@ -196,28 +204,7 @@ def final_compiler_node(state: GraphState):
 def evaluation_agent_node(state: GraphState):
     update_progress(state, "Evaluation_Agent")
     evaluator_llm = llm.with_structured_output(EvaluationReport)
-    
-    lesson_content = state.get("compiled_lesson", "")
-    quiz_content = state.get("quiz", "")
-    topic = state.get("topic", "")
-    grade_level = state.get("grade_level", "")
-    
-    evaluation_prompt = f"""Evaluate this lesson plan for {grade_level} students on the topic of '{topic}'.
-
-Lesson Content:
-{lesson_content}
-
-Quiz Content:
-{quiz_content}
-
-Please evaluate the lesson on three criteria:
-1. Clarity (1-10): How clear and understandable is the content?
-2. Engagement (1-10): How engaging and interesting is the lesson?
-3. Educational Value (1-10): How well does it teach the concepts?
-
-Provide specific feedback for each criterion."""
-    
-    return {"evaluation_report": evaluator_llm.invoke(evaluation_prompt)}
+    return {"evaluation_report": evaluator_llm.invoke("Evaluate this lesson...")}
 
 def save_to_firestore_node(state: GraphState):
     update_progress(state, "save_to_firestore_node")
@@ -234,7 +221,7 @@ def save_to_firestore_node(state: GraphState):
             "quizMarkdown": state.get("quiz", ""),
             "analogy": state.get("supplemental_content", ""),
             "imageUrl": state.get("image_url", ""),
-            "evaluation": report.model_dump() if isinstance(report, BaseModel) else {}
+            "evaluation": report.dict() if isinstance(report, BaseModel) else {}
         }
         db.collection('users').document(user_id).collection('threads').document(thread_id).collection('lessons').document(run_id).set(doc)
     except Exception as e: final_status = "Error"
@@ -242,8 +229,12 @@ def save_to_firestore_node(state: GraphState):
         db.collection('progress_tracking').document(run_id).update({"status": final_status, "progress": 100})
     except Exception: pass
     return {}
-    
+
+# ==============================================================================
+# --- 5. GRAPH CONSTRUCTION ---
+# ==============================================================================
 builder = StateGraph(GraphState)
+
 builder.add_node("Intent_Parser", intent_parser_node)
 builder.add_node("RAG_Agent", rag_agent_node)
 builder.add_node("Creative_Assistant", creative_assistant_node)
@@ -256,13 +247,16 @@ builder.add_node("hallucination_guard", hallucination_guard_node)
 builder.add_node("Final_Compiler", final_compiler_node)
 builder.add_node("Evaluation_Agent", evaluation_agent_node)
 builder.add_node("save_to_firestore_node", save_to_firestore_node)
+
 builder.set_entry_point("Intent_Parser")
 builder.add_edge("Intent_Parser", "RAG_Agent")
+
 def should_continue(state):
     if state.get("error"):
         print(f"Stopping graph due to RAG agent error: {state['error']}")
         return "end"
     return "continue"
+
 builder.add_conditional_edges(
     "RAG_Agent", should_continue,
     {"continue": "Creative_Assistant", "end": "save_to_firestore_node"}
@@ -279,28 +273,37 @@ builder.add_edge("Imagen_Generator", "Final_Compiler")
 builder.add_edge("Final_Compiler", "Evaluation_Agent")
 builder.add_edge("Evaluation_Agent", "save_to_firestore_node")
 builder.add_edge("save_to_firestore_node", END)
+
 graph = builder.compile()
 
+# ==============================================================================
+# --- 6. CLOUD FUNCTION ENTRY POINT ---
+# ==============================================================================
 @functions_framework.http
 def handler(request):
     request_json = request.get_json(silent=True)
     if not request_json or 'user_request' not in request_json or 'user_id' not in request_json:
         return ("Invalid request: JSON body must include 'user_request' and 'user_id'.", 400)
+
     user_request = request_json['user_request']
     user_id = request_json['user_id']
     thread_id = request_json.get('thread_id', str(uuid.uuid4()))
     run_id = str(uuid.uuid4())
+
     if not db or not RAG_RETRIEVER:
         return ("Internal Server Error: Backend not ready.", 500)
+
     if db:
         db.collection('progress_tracking').document(run_id).set({
             "status": "Accepted", "progress": 0, "current_node": "None", "user_id": user_id,
             "thread_id": thread_id, "received_at": firestore.SERVER_TIMESTAMP
         })
+
     initial_state = {
         "run_id": run_id, "user_id": user_id, "thread_id": thread_id,
         "user_request": user_request, "retriever": RAG_RETRIEVER,
     }
+
     try:
         graph.invoke(initial_state)
         return ({"status": "processing_started", "run_id": run_id, "thread_id": thread_id}, 202)
@@ -308,65 +311,3 @@ def handler(request):
         if db:
             db.collection('progress_tracking').document(run_id).update({"status": "Failed", "error": str(e)})
         return ({"status": "error", "run_id": run_id, "message": str(e)}, 500)
-
-
-# ==============================================================================
-# --- 7. LOCAL INTERACTIVE TESTING (NEW) ---
-# ==============================================================================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Sahayak Agent locally.")
-    parser.add_argument(
-        '--local',
-        action='store_true',
-        help='Run the agent in local interactive mode for testing.'
-    )
-    args = parser.parse_args()
-
-    if args.local:
-        print("🚀 Starting Sahayak Agent in Local Interactive Mode...")
-
-        if not db or not RAG_RETRIEVER:
-            print("❌ Backend is not ready. Exiting.")
-            exit(1)
-            
-        # Simulate the API request by getting input from the user
-        user_id = input("Enter your User ID (e.g., 'user_123'): ").strip()
-        thread_id = input("Enter a Thread ID (or press Enter to create a new one): ").strip()
-        user_request = input("Hello! What lesson can I prepare for you today?\n> ").strip()
-
-        if not all([user_id, user_request]):
-            print("User ID and request are required. Exiting.")
-            exit(1)
-
-        # Use the provided thread_id or generate a new one
-        thread_id = thread_id if thread_id else str(uuid.uuid4())
-        run_id = str(uuid.uuid4())
-        
-        print(f"\n--- Starting Run ---")
-        print(f"  Run ID: {run_id}")
-        print(f"  User ID: {user_id}")
-        print(f"  Thread ID: {thread_id}")
-        print("--------------------")
-
-        # Create initial progress document in Firestore
-        db.collection('progress_tracking').document(run_id).set({
-            "status": "Accepted", "progress": 0, "current_node": "None", "user_id": user_id,
-            "thread_id": thread_id, "received_at": firestore.SERVER_TIMESTAMP
-        })
-        
-        # Prepare and invoke the graph
-        initial_state = {
-            "run_id": run_id, "user_id": user_id, "thread_id": thread_id,
-            "user_request": user_request, "retriever": RAG_RETRIEVER,
-        }
-        
-        graph.invoke(initial_state)
-        
-        print("\n✅ Local run complete. Check Firestore for progress and final output.")
-    
-    else:
-        print("Usage:")
-        print("  - To run as a local server for API testing:")
-        print("    functions-framework --target=handler --port=8080")
-        print("\n  - To run in local interactive mode for direct testing:")
-        print("    python main.py --local")
