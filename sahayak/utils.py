@@ -5,16 +5,41 @@ import os
 import sqlite3
 import speech_recognition as sr
 import requests
+import glob
+import re
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, db
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_google_vertexai import VertexAIImageGeneratorChat
 from langdetect import detect, LangDetectException
+
+# Import Gemini embeddings (replacing HuggingFace)
+try:
+    from .gemini_embeddings import gemini_embeddings
+    if gemini_embeddings is None or not gemini_embeddings.is_available():
+        raise ImportError("Gemini embeddings not available")
+    USE_GEMINI_EMBEDDINGS = True
+except ImportError as e:
+    USE_GEMINI_EMBEDDINGS = False
+
+# Always import HuggingFace embeddings as fallback
+try:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    HUGGINGFACE_AVAILABLE = True
+except ImportError:
+    print("❌ HuggingFace embeddings not available")
+    HUGGINGFACE_AVAILABLE = False
+
+# Import Firestore database (new)
+try:
+    from .firestore_db import FirestoreDatabase
+    FIRESTORE_AVAILABLE = True
+except ImportError:
+    FIRESTORE_AVAILABLE = False
 
 # --- Environment Setup ---
 load_dotenv()
@@ -23,10 +48,18 @@ DB_PATH = "sahayak_memory.db"
 # Initialize image generation tool once
 try:
     image_generation_tool = VertexAIImageGeneratorChat(model="imagegeneration@006")
-    print("✅ Vertex AI Image Generation initialized")
 except Exception as e:
-    print(f"⚠️ Vertex AI Image Generation not available: {e}. Using fallback.")
     image_generation_tool = None
+
+# Initialize database (Firestore primary, SQLite fallback)
+if FIRESTORE_AVAILABLE:
+    try:
+        firestore_db = FirestoreDatabase()
+        USE_FIRESTORE = True
+    except Exception as e:
+        USE_FIRESTORE = False
+else:
+    USE_FIRESTORE = False
 
 # --- Language Detection and Support ---
 def detect_document_language(text_sample: str) -> str:
@@ -58,6 +91,271 @@ def detect_document_language(text_sample: str) -> str:
     except LangDetectException as e:
         print(f"⚠️ Language detection failed: {e}")
         return "English"  # Default fallback
+
+def detect_request_language(user_request: str) -> str:
+    """Detect the language of the user request or desired output language."""
+    try:
+        # First, check for explicit language instructions in English
+        language_instructions = {
+            r'in\s+tamil': 'Tamil',
+            r'in\s+hindi': 'Hindi',
+            r'in\s+kannada': 'Kannada',
+            r'in\s+telugu': 'Telugu',
+            r'in\s+marathi': 'Marathi',
+            r'in\s+bengali': 'Bengali',
+            r'tamil\s+language': 'Tamil',
+            r'hindi\s+language': 'Hindi',
+            r'kannada\s+language': 'Kannada',
+            r'telugu\s+language': 'Telugu',
+            r'marathi\s+language': 'Marathi',
+            r'bengali\s+language': 'Bengali',
+            r'தமிழில்': 'Tamil',
+            r'हिंदी में': 'Hindi',
+            r'ಕನ್ನಡದಲ್ಲಿ': 'Kannada',
+            r'తెలుగులో': 'Telugu',
+            r'మరాఠీలో': 'Marathi',
+            r'বাংলায়': 'Bengali'
+        }
+        
+        for pattern, language in language_instructions.items():
+            if re.search(pattern, user_request, re.IGNORECASE):
+                print(f"🌐 Language instruction detected: {language}")
+                return language
+        
+        # If no explicit instruction, detect from the text content
+        language = detect(user_request)
+        language_map = {
+            'en': 'English',
+            'hi': 'Hindi', 
+            'kn': 'Kannada',
+            'ta': 'Tamil',
+            'te': 'Telugu',
+            'ml': 'Malayalam',
+            'mr': 'Marathi',
+            'bn': 'Bengali',
+            'gu': 'Gujarati',
+            'pa': 'Punjabi',
+            'or': 'Odia'
+        }
+        detected_lang = language_map.get(language, 'English')
+        print(f"🌐 Request language detected: {detected_lang}")
+        return detected_lang
+    except:
+        return "English"
+
+def extract_grade_from_request(user_request: str) -> str:
+    """Extract grade level from user request."""
+    grade_patterns = {
+        r'(\d+)(?:st|nd|rd|th)\s*grade': lambda m: f"class{m.group(1)}",
+        r'class\s*(\d+)': lambda m: f"class{m.group(1)}",
+        r'grade\s*(\d+)': lambda m: f"class{m.group(1)}",
+        r'(\d+)ஆம்\s*வகுப்பு': lambda m: f"class{m.group(1)}",  # Tamil: 6ஆம் வகுப்பு
+        r'(\d+)\s*வகுப்பு': lambda m: f"class{m.group(1)}",      # Tamil: 6 வகுப்பு
+        r'(\d+)ஆம்\s*தரம்': lambda m: f"class{m.group(1)}",      # Tamil: 6ஆம் தரம்
+        r'(\d+)\s*कक्षा': lambda m: f"class{m.group(1)}",         # Hindi
+        r'(\d+)\s*ತರಗತಿ': lambda m: f"class{m.group(1)}",         # Kannada
+    }
+    
+    for pattern, formatter in grade_patterns.items():
+        match = re.search(pattern, user_request, re.IGNORECASE)
+        if match:
+            grade = formatter(match)
+            print(f"📚 Grade extracted: {grade}")
+            return grade
+    
+    # Default to class8 if no grade found
+    print("📚 No grade detected, defaulting to class8")
+    return "class8"
+
+def extract_subject_from_request(user_request: str) -> str:
+    """Extract subject from user request."""
+    subject_patterns = {
+        r'science|அறிவியல்|विज्ञान|ವಿಜ್ಞಾನ': 'science',
+        r'math|mathematics|கணிதம்|गणित|ಗಣಿತ': 'mathematics',
+        r'social|social studies|சமூக அறிவியல்|सामाजिक विज्ञान|ಸಾಮಾಜಿಕ ವಿಜ್ಞಾನ': 'social_studies'
+    }
+    
+    for pattern, subject in subject_patterns.items():
+        if re.search(pattern, user_request, re.IGNORECASE):
+            print(f"📖 Subject extracted: {subject}")
+            return subject
+    
+    # Default to science if no subject found
+    print("📖 No subject detected, defaulting to science")
+    return "science"
+
+def find_best_source_material(user_request: str) -> dict:
+    """Find the best matching source material based on user request."""
+    print(f"🔍 Finding best source material for: '{user_request}'")
+    
+    # Detect language and extract grade/subject
+    language = detect_request_language(user_request)
+    grade = extract_grade_from_request(user_request)
+    subject = extract_subject_from_request(user_request)
+    
+    # Map language names to directory names
+    language_dir_map = {
+        'English': 'english',
+        'Hindi': 'hindi',
+        'Kannada': 'kannada',
+        'Tamil': 'tamil',
+        'Telugu': 'telugu',
+        'Marathi': 'marathi',
+        'Bengali': 'bengali'
+    }
+    
+    language_dir = language_dir_map.get(language, 'english')
+    
+    # Construct the expected path
+    expected_path = f"source_materials/{language_dir}/{grade}/{subject}"
+    print(f"📁 Looking for materials in: {expected_path}")
+    
+    # Find PDFs in the expected directory
+    if os.path.exists(expected_path):
+        pdf_files = glob.glob(f"{expected_path}/*.pdf")
+        if pdf_files:
+            # Return the first available PDF
+            selected_pdf = pdf_files[0]
+            print(f"✅ Found exact source material: {selected_pdf}")
+            return {
+                "path": selected_pdf,
+                "match_type": "exact",
+                "requested_language": language,
+                "requested_grade": grade,
+                "requested_subject": subject,
+                "found_language": language,
+                "found_grade": grade,
+                "found_subject": subject
+            }
+    
+    # Smart Fallback Strategy:
+    # 1. Try same subject, different grade
+    # 2. Try same grade, different subject (but only if subject is related)
+    # 3. Try same language, different grade and subject
+    # 4. Try English equivalent
+    
+    print(f"🔍 Implementing smart fallback strategy...")
+    
+    # Fallback 1: Same subject, different grade
+    subject_pattern = f"source_materials/{language_dir}/*/{subject}/*.pdf"
+    subject_files = glob.glob(subject_pattern)
+    
+    if subject_files:
+        # Sort by grade to find closest match
+        subject_files.sort()
+        selected_pdf = subject_files[0]
+        path_parts = selected_pdf.split('/')
+        found_grade = path_parts[2]
+        
+        # Check for significant grade downgrade (more than 2 grades down)
+        requested_grade_num = int(grade.replace('class', ''))
+        found_grade_num = int(found_grade.replace('class', ''))
+        grade_difference = requested_grade_num - found_grade_num
+        
+        if grade_difference > 2:
+            print(f"❌ Significant grade downgrade detected: {grade} → {found_grade} (difference: {grade_difference})")
+            print(f"⚠️ Skipping this fallback to avoid educational injustice")
+        else:
+            print(f"✅ Found same subject ({subject}) in grade {found_grade}")
+            print(f"⚠️ Using fallback: {selected_pdf}")
+            
+            return {
+                "path": selected_pdf,
+                "match_type": "fallback_same_subject",
+                "requested_language": language,
+                "requested_grade": grade,
+                "requested_subject": subject,
+                "found_language": language,
+                "found_grade": found_grade,
+                "found_subject": subject,
+                "warning": f"Requested {language} {grade} {subject} not available. Using {language} {found_grade} {subject} as fallback."
+            }
+    
+    # Fallback 2: Same grade, related subject (only for science/mathematics)
+    if subject in ['science', 'mathematics']:
+        related_subjects = ['science', 'mathematics'] if subject == 'science' else ['mathematics', 'science']
+        
+        for related_subject in related_subjects:
+            if related_subject != subject:
+                grade_pattern = f"source_materials/{language_dir}/{grade}/{related_subject}/*.pdf"
+                grade_files = glob.glob(grade_pattern)
+                
+                if grade_files:
+                    selected_pdf = grade_files[0]
+                    print(f"✅ Found related subject ({related_subject}) in same grade ({grade})")
+                    print(f"⚠️ Using fallback: {selected_pdf}")
+                    
+                    return {
+                        "path": selected_pdf,
+                        "match_type": "fallback_related_subject",
+                        "requested_language": language,
+                        "requested_grade": grade,
+                        "requested_subject": subject,
+                        "found_language": language,
+                        "found_grade": grade,
+                        "found_subject": related_subject,
+                        "warning": f"Requested {language} {grade} {subject} not available. Using {language} {grade} {related_subject} as fallback."
+                    }
+    
+    # Fallback 3: Same language, any grade and subject
+    language_pattern = f"source_materials/{language_dir}/**/*.pdf"
+    language_files = glob.glob(language_pattern, recursive=True)
+    
+    if language_files:
+        selected_pdf = language_files[0]
+        path_parts = selected_pdf.split('/')
+        found_grade = path_parts[2] if len(path_parts) > 2 else grade
+        found_subject = path_parts[3] if len(path_parts) > 3 else subject
+        
+        print(f"⚠️ Using language fallback: {selected_pdf}")
+        print(f"⚠️ Mismatch: Requested {language} {grade} {subject}, Found {language} {found_grade} {found_subject}")
+        
+        return {
+            "path": selected_pdf,
+            "match_type": "fallback_language_only",
+            "requested_language": language,
+            "requested_grade": grade,
+            "requested_subject": subject,
+            "found_language": language,
+            "found_grade": found_grade,
+            "found_subject": found_subject,
+            "warning": f"Requested {language} {grade} {subject} not available. Using {language} {found_grade} {found_subject} as fallback."
+        }
+    
+    # Fallback 4: English equivalent (same subject and grade)
+    english_pattern = f"source_materials/english/{grade}/{subject}/*.pdf"
+    english_files = glob.glob(english_pattern)
+    
+    if english_files:
+        selected_pdf = english_files[0]
+        print(f"✅ Found English equivalent: {selected_pdf}")
+        
+        return {
+            "path": selected_pdf,
+            "match_type": "fallback_english_equivalent",
+            "requested_language": language,
+            "requested_grade": grade,
+            "requested_subject": subject,
+            "found_language": "English",
+            "found_grade": grade,
+            "found_subject": subject,
+            "warning": f"Requested {language} {grade} {subject} not available. Using English {grade} {subject} as fallback."
+        }
+    
+    # Final fallback: use default English material
+    default_path = "source_materials/english/class8/science/KARNATAKA_SCIENCE_CLASS8_ENGLISH_2023.pdf"
+    print(f"❌ No matching source material found, using default: {default_path}")
+    return {
+        "path": default_path,
+        "match_type": "default",
+        "requested_language": language,
+        "requested_grade": grade,
+        "requested_subject": subject,
+        "found_language": "English",
+        "found_grade": "class8",
+        "found_subject": "science",
+        "warning": f"Requested {language} {grade} {subject} not available. Using English class8 science as default."
+    }
 
 def get_language_specific_prompt(language: str, topic: str, grade_level: str) -> str:
     """Generate language-specific prompts for lesson generation."""
@@ -98,7 +396,13 @@ def initialize_firebase():
 
 # --- Database and RAG Setup ---
 def setup_memory_database():
-    """Initializes the SQLite database."""
+    """Initializes the database (Firestore primary, SQLite fallback)."""
+    if USE_FIRESTORE:
+        print("✅ Using Firestore database")
+        return
+    
+    # Fallback to SQLite
+    print("⚠️ Using SQLite database (fallback)")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -117,14 +421,97 @@ def setup_memory_database():
     """)
     conn.commit()
     conn.close()
-    print("✅ Database setup complete.")
+    print("✅ SQLite database setup complete.")
 
-def setup_rag_pipeline(source_document_path: str = None):
-    """Sets up the RAG pipeline with automatic source selection."""
+def add_interaction_to_database(topic: str, grade_level: str, language: str = "English",
+                               clarity_score: int = None, engagement_score: int = None,
+                               educational_value_score: int = None, lesson_file: str = None,
+                               quiz_file: str = None) -> str:
+    """Add interaction to database (Firestore or SQLite)."""
+    global USE_FIRESTORE
     
-    if source_document_path is None:
+    if USE_FIRESTORE:
+        try:
+            doc_id = firestore_db.add_interaction(
+                topic=topic,
+                grade_level=grade_level,
+                language=language,
+                clarity_score=clarity_score,
+                engagement_score=engagement_score,
+                educational_value_score=educational_value_score,
+                lesson_file=lesson_file,
+                quiz_file=quiz_file
+            )
+            print(f"✅ Interaction added to Firestore: {doc_id}")
+            return doc_id
+        except Exception as e:
+            print(f"⚠️ Firestore failed, falling back to SQLite: {e}")
+            USE_FIRESTORE = False
+    
+    # SQLite fallback
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO interactions (topic, grade_level, language, clarity_score, 
+                                engagement_score, educational_value_score, lesson_file, quiz_file)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (topic, grade_level, language, clarity_score, engagement_score, 
+          educational_value_score, lesson_file, quiz_file))
+    interaction_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    print(f"✅ Interaction added to SQLite: {interaction_id}")
+    return str(interaction_id)
+
+def get_database_statistics():
+    """Get database statistics (Firestore or SQLite)."""
+    global USE_FIRESTORE
+    
+    if USE_FIRESTORE:
+        try:
+            stats = firestore_db.get_statistics()
+            print("✅ Retrieved statistics from Firestore")
+            return stats
+        except Exception as e:
+            print(f"⚠️ Firestore failed, falling back to SQLite: {e}")
+            USE_FIRESTORE = False
+    
+    # SQLite fallback
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM interactions")
+    total_interactions = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT AVG(clarity_score), AVG(engagement_score), AVG(educational_value_score) FROM interactions WHERE clarity_score IS NOT NULL")
+    averages = cursor.fetchone()
+    conn.close()
+    
+    return {
+        'total_interactions': total_interactions,
+        'average_clarity': averages[0] or 0,
+        'average_engagement': averages[1] or 0,
+        'average_educational_value': averages[2] or 0
+    }
+
+def setup_rag_pipeline(source_document_path: str = None, user_request: str = None):
+    """Sets up the RAG pipeline with intelligent source selection."""
+    
+    source_info = None
+    
+    if source_document_path is None and user_request:
+        # Use intelligent source selection based on user request
+        source_info = find_best_source_material(user_request)
+        source_document_path = source_info["path"]
+    elif source_document_path is None:
         # Default to the organized source material
         source_document_path = "source_materials/english/class8/science/KARNATAKA_SCIENCE_CLASS8_ENGLISH_2023.pdf"
+        source_info = {
+            "path": source_document_path,
+            "match_type": "default",
+            "found_language": "English",
+            "found_grade": "class8",
+            "found_subject": "science"
+        }
     
     print(f"📚 Loading source material: {source_document_path}")
     
@@ -141,13 +528,68 @@ def setup_rag_pipeline(source_document_path: str = None):
     
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     docs_split = splitter.split_documents(docs)
-    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = FAISS.from_documents(docs_split, embedding_model)
+    
+    # Use Gemini embeddings if available, otherwise use HuggingFace
+    embedding_success = False
+    
+    if USE_GEMINI_EMBEDDINGS and gemini_embeddings is not None:
+        try:
+            print("🔍 Using Gemini embeddings for vector creation...")
+            # Use the wrapper methods that include retry logic
+            texts = [doc.page_content for doc in docs_split]
+            embeddings_list = gemini_embeddings.embed_documents(texts)
+            
+            # Create FAISS vectorstore manually with embeddings
+            import numpy as np
+            from langchain_community.vectorstores import FAISS
+            from langchain_core.embeddings import Embeddings
+            
+            # Create a temporary embedding class for FAISS
+            class TempEmbeddings(Embeddings):
+                def __init__(self, embeddings_list):
+                    self.embeddings_list = embeddings_list
+                    self.current_index = 0
+                
+                def embed_documents(self, texts):
+                    # Return pre-computed embeddings
+                    result = self.embeddings_list[self.current_index:self.current_index + len(texts)]
+                    self.current_index += len(texts)
+                    return result
+                
+                def embed_query(self, text):
+                    # For queries, we'll need to compute new embeddings
+                    return gemini_embeddings.embed_query(text)
+            
+            temp_embeddings = TempEmbeddings(embeddings_list)
+            vectorstore = FAISS.from_documents(docs_split, temp_embeddings)
+            print("✅ Vector store created with Gemini embeddings")
+            embedding_success = True
+            
+        except Exception as e:
+            print(f"⚠️ Gemini embeddings failed, falling back to HuggingFace: {e}")
+    
+    # Fallback to HuggingFace if Gemini failed or is not available
+    if not embedding_success:
+        if HUGGINGFACE_AVAILABLE:
+            try:
+                embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+                vectorstore = FAISS.from_documents(docs_split, embedding_model)
+                print("✅ Vector store created with HuggingFace embeddings")
+                embedding_success = True
+            except Exception as e:
+                print(f"⚠️ HuggingFace embeddings also failed: {e}")
+        else:
+            print("❌ HuggingFace embeddings not available")
+    
+    if not embedding_success:
+        raise Exception("No embedding model available - both Gemini and HuggingFace failed")
+    
     retriever = vectorstore.as_retriever(search_kwargs={'k': 10})
     
     # Store metadata in a way that doesn't conflict with the retriever object
     retriever._document_language = detected_language
     retriever._source_path = source_document_path
+    retriever._source_info = source_info
     return retriever
 
 # --- Image Generation ---

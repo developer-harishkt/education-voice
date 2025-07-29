@@ -3,28 +3,77 @@
 import datetime
 from firebase_admin import db
 from langchain_google_vertexai import ChatVertexAI
-from langchain_community.tools.tavily_search import TavilySearchResults
 
 from .state import GraphState, Intent, EvaluationReport
 from .utils import generate_image_with_fallback
 
+# Import Vertex AI Search (replacing Tavily)
+try:
+    from .vertex_search import vertex_search_tool
+    if vertex_search_tool is None:
+        raise ImportError("Vertex AI Search not available")
+except ImportError as e:
+    # Fallback to Tavily if needed
+    try:
+        from langchain_tavily import TavilySearch
+        vertex_search_tool = TavilySearch(max_results=2)
+    except ImportError:
+        vertex_search_tool = None
+
 # --- Tool and Model Setup ---
 llm = ChatVertexAI(model_name="gemini-2.5-pro")
-tavily_tool = TavilySearchResults(max_results=2)
 
 # --- Agent Node Definitions ---
 
 def intent_parser_node(state: GraphState):
-    """Parses the user's request into a structured format."""
+    """Parses the user's request and sets up RAG pipeline after validation."""
     print("---NODE: INTENT PARSER---")
+    
+    # First parse the intent
     structured_llm = llm.with_structured_output(Intent)
     prompt = f"Parse the following user request to extract the lesson topic and grade level.\n\nRequest: \"{state['user_request']}\""
     try:
         parsed_intent = structured_llm.invoke(prompt)
         print(f"✅ Intent Parsed: Topic='{parsed_intent.topic}', Grade='{parsed_intent.grade_level}'")
-        return {"topic": parsed_intent.topic, "grade_level": parsed_intent.grade_level}
     except Exception as e:
         return {"error": f"Failed to parse user request: {e}"}
+    
+    # Now set up RAG pipeline after validation has passed
+    user_request = state["user_request"]
+    print(f"🔍 Setting up RAG pipeline for validated request: '{user_request}'")
+    
+    try:
+        from sahayak.utils import setup_rag_pipeline
+        intelligent_retriever = setup_rag_pipeline(user_request=user_request)
+        
+        # Check for source material mismatch
+        if hasattr(intelligent_retriever, '_source_info') and intelligent_retriever._source_info:
+            source_info = intelligent_retriever._source_info
+            if source_info.get('match_type') in ['fallback_same_subject', 'fallback_related_subject', 'fallback_language_only', 'fallback_english_equivalent', 'default']:
+                warning_msg = source_info.get('warning', 'Source material mismatch detected')
+                print(f"⚠️ {warning_msg}")
+                
+                # Update status tracker with warning if available
+                status_tracker = state.get('status_tracker')
+                if status_tracker:
+                    status_tracker.mark_warning(warning_msg, "Intent_Parser")
+        
+        return {
+            "topic": parsed_intent.topic, 
+            "grade_level": parsed_intent.grade_level,
+            "retriever": intelligent_retriever
+        }
+        
+    except Exception as e:
+        error_msg = f"Failed to setup RAG pipeline: {e}"
+        print(f"❌ {error_msg}")
+        
+        # Update status tracker with error if available
+        status_tracker = state.get('status_tracker')
+        if status_tracker:
+            status_tracker.mark_failed(error_msg, "Intent_Parser")
+        
+        return {"error": error_msg}
 
 def rag_agent_node(state: GraphState):
     """Retrieves a broad set of documents from the vector store."""
@@ -61,11 +110,44 @@ def llm_reranker_node(state: GraphState):
         print(f"✅ Reranker selected {len(reranked_docs_text)} documents.")
         grounded_content = "\n\n---\n\n".join(reranked_docs_text)
 
-        topic_check_prompt = f"Analyze if the following text contains substantial information about '{topic}'. The text is a curated selection of source material. Return ONLY 'yes' or 'no'."
-        has_topic = llm.invoke(topic_check_prompt).content.lower().strip()
+        # Check if source material matches the request
+        source_info = getattr(state.get("retriever"), "_source_info", None)
+        if source_info and source_info.get('match_type') in ['fallback_same_subject', 'fallback_related_subject', 'fallback_language_only', 'fallback_english_equivalent', 'default']:
+            warning_msg = source_info.get('warning', 'Source material mismatch detected')
+            print(f"⚠️ {warning_msg}")
+            
+            # Check for significant grade downgrade
+            if source_info.get('match_type') == 'fallback_same_subject':
+                requested_grade = source_info.get('requested_grade', 'class8')
+                found_grade = source_info.get('found_grade', 'class8')
+                
+                try:
+                    requested_grade_num = int(requested_grade.replace('class', ''))
+                    found_grade_num = int(found_grade.replace('class', ''))
+                    grade_difference = requested_grade_num - found_grade_num
+                    
+                    if grade_difference > 2:
+                        error_msg = f"I apologize, but I cannot create a lesson for {requested_grade} students using {found_grade} material. This would be an educational injustice. Please request a lesson for {found_grade} or lower, or use English {requested_grade} materials."
+                        print(f"❌ {error_msg}")
+                        return {"error": error_msg}
+                except ValueError:
+                    pass  # Continue with normal flow if grade parsing fails
+            
+            # Enhanced topic check for mismatched materials
+            topic_check_prompt = f"""Analyze if the following text contains substantial information about '{topic}' for {state['grade_level']} students. 
+            The text is from {source_info.get('found_language', 'unknown')} {source_info.get('found_grade', 'unknown')} {source_info.get('found_subject', 'unknown')} material.
+            Return ONLY 'yes' or 'no' with a brief reason."""
+            
+            topic_response = llm.invoke(topic_check_prompt).content.lower().strip()
+            if 'yes' not in topic_response:
+                return {"error": f"I apologize, but I don't have enough reliable information about '{topic}' in the available {source_info.get('found_language', 'English')} {source_info.get('found_grade', 'class8')} {source_info.get('found_subject', 'science')} material to create a lesson. {warning_msg}"}
+        else:
+            # Standard topic check for exact matches
+            topic_check_prompt = f"Analyze if the following text contains substantial information about '{topic}'. The text is a curated selection of source material. Return ONLY 'yes' or 'no'."
+            has_topic = llm.invoke(topic_check_prompt).content.lower().strip()
 
-        if has_topic != "yes":
-            return {"error": f"I apologize, but I don't have enough reliable information about '{topic}' in my source material to create a lesson."}
+            if has_topic != "yes":
+                return {"error": f"I apologize, but I don't have enough reliable information about '{topic}' in my source material to create a lesson."}
 
         return {"grounded_content": grounded_content}
     except Exception as e:
@@ -75,8 +157,13 @@ def creative_assistant_node(state: GraphState):
     """Generates a culturally relevant analogy for the lesson."""
     print("---NODE: CREATIVE ASSISTANT---")
     topic, grade = state["topic"], state["grade_level"]
+    
+    if vertex_search_tool is None:
+        print("⚠️ No search tool available, skipping analogy generation")
+        return {"supplemental_content": f"Note: Could not generate cultural analogy for '{topic}' due to search tool unavailability."}
+    
     query = llm.invoke(f"Generate a search query for culturally relevant analogies to teach '{topic}' to {grade} students in India.").content.strip()
-    search_results = tavily_tool.invoke(query)
+    search_results = vertex_search_tool.invoke(query)
     results_content = "\n\n".join([res.get('content', '') for res in search_results if isinstance(res, dict) and res.get('content')])
     synthesis = llm.invoke(f"Create a simple, two-sentence analogy to explain '{topic}' to {grade} students in India, using these search results:\n\n{results_content}").content.strip()
     return {"supplemental_content": synthesis}

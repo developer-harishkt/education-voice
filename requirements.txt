@@ -14,17 +14,25 @@ uvicorn[standard]
 # Firebase Integration
 firebase-admin
 
-# RAG & Embeddings
+# RAG & Embeddings (KEEPING FAISS)
 faiss-cpu
-sentence-transformers
 langchain-text-splitters
 pypdf
+
+# Embeddings (Gemini primary, HuggingFace fallback)
+sentence-transformers
 
 # Language Detection
 langdetect
 
 # Other Tools
 python-dotenv
-tavily-python
 requests
 SpeechRecognition
+
+# Google Cloud Services
+google-cloud-firestore
+google-cloud-discoveryengine
+
+# Fix SSL warnings - use compatible urllib3 version
+urllib3<2.0.0

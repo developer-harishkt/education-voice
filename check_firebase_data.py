@@ -27,54 +27,21 @@ def check_firebase_data():
         
         if data:
             print(f"✅ Found {len(data)} lesson entries in Firebase:")
-            for user_id, user_data in data.items():
+            for user_id, lesson_data in data.items():
                 print(f"\n👤 User: {user_id}")
+                print(f"   Topic: {lesson_data.get('topic', 'N/A')}")
+                print(f"   Grade Level: {lesson_data.get('grade_level', 'N/A')}")
+                print(f"   Status: {lesson_data.get('status', 'N/A')}")
+                print(f"   Timestamp: {lesson_data.get('timestamp', 'N/A')}")
                 
-                # Check if user_data is a dict (new structure) or direct lesson data (old structure)
-                if isinstance(user_data, dict) and 'latest' in user_data:
-                    # New structure with multiple lessons
-                    latest_lesson = user_data.get('latest', {})
-                    print(f"   📚 Latest Lesson:")
-                    print(f"      Topic: {latest_lesson.get('topic', 'N/A')}")
-                    print(f"      Grade Level: {latest_lesson.get('grade_level', 'N/A')}")
-                    print(f"      Status: {latest_lesson.get('status', 'N/A')}")
-                    print(f"      Timestamp: {latest_lesson.get('timestamp', 'N/A')}")
-                    print(f"      Lesson ID: {latest_lesson.get('lesson_id', 'N/A')}")
-                    
-                    # Count total lessons for this user
-                    lesson_count = len([k for k in user_data.keys() if k not in ['latest', 'errors']])
-                    print(f"   📊 Total Lessons: {lesson_count}")
-                    
-                    # Check if lesson content exists
-                    if latest_lesson.get('lesson_plan'):
-                        print(f"      ✅ Lesson plan: {len(latest_lesson['lesson_plan'])} characters")
-                    if latest_lesson.get('quiz'):
-                        print(f"      ✅ Quiz: {len(latest_lesson['quiz'])} characters")
-                    if latest_lesson.get('evaluation'):
-                        eval_data = latest_lesson['evaluation']
-                        print(f"      📊 Evaluation: Clarity={eval_data.get('clarity_score', 'N/A')}, Engagement={eval_data.get('engagement_score', 'N/A')}")
-                    
-                    # List all lessons for this user
-                    print(f"   📋 All Lessons:")
-                    for lesson_key, lesson_data in user_data.items():
-                        if lesson_key not in ['latest', 'errors'] and isinstance(lesson_data, dict):
-                            print(f"      - {lesson_data.get('lesson_id', lesson_key)}: {lesson_data.get('topic', 'N/A')} ({lesson_data.get('grade_level', 'N/A')})")
-                            
-                else:
-                    # Old structure (single lesson per user)
-                    print(f"   Topic: {user_data.get('topic', 'N/A')}")
-                    print(f"   Grade Level: {user_data.get('grade_level', 'N/A')}")
-                    print(f"   Status: {user_data.get('status', 'N/A')}")
-                    print(f"   Timestamp: {user_data.get('timestamp', 'N/A')}")
-                    
-                    # Check if lesson content exists
-                    if user_data.get('lesson_plan'):
-                        print(f"   ✅ Lesson plan: {len(user_data['lesson_plan'])} characters")
-                    if user_data.get('quiz'):
-                        print(f"   ✅ Quiz: {len(user_data['quiz'])} characters")
-                    if user_data.get('evaluation'):
-                        eval_data = user_data['evaluation']
-                        print(f"   📊 Evaluation: Clarity={eval_data.get('clarity_score', 'N/A')}, Engagement={eval_data.get('engagement_score', 'N/A')}")
+                # Check if lesson content exists
+                if lesson_data.get('lesson_plan'):
+                    print(f"   ✅ Lesson plan: {len(lesson_data['lesson_plan'])} characters")
+                if lesson_data.get('quiz'):
+                    print(f"   ✅ Quiz: {len(lesson_data['quiz'])} characters")
+                if lesson_data.get('evaluation'):
+                    eval_data = lesson_data['evaluation']
+                    print(f"   📊 Evaluation: Clarity={eval_data.get('clarity_score', 'N/A')}, Engagement={eval_data.get('engagement_score', 'N/A')}")
         else:
             print("ℹ️ No lesson data found in Firebase yet")
             
